@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	agglayerGrpc "github.com/agglayer/aggkit/agglayer/grpc"
+	aggLayerTypesLatest "github.com/agglayer/aggkit/agglayer/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"net"
 	"strings"
 	"time"
@@ -125,6 +128,92 @@ func (a *Aggregator) settleWithAggLayer(
 
 	// TODO: wait for synchronizer to catch up
 	return true
+}
+
+func (a *Aggregator) settleWithAgglayerUsingCertificate(
+	ctx context.Context,
+	proof *state.Proof,
+	inputs ethmanTypes.FinalProofInputs,
+) (success bool) {
+
+	grpcClient, err := agglayerGrpc.NewAgglayerGRPCClient(a.cfg.AggLayerURL, false)
+	if err != nil {
+		log.Errorf("failed to create agglayer grpc client: %v", err)
+		a.handleFailureToSendToAggLayer(ctx, proof)
+		return false
+	}
+
+	// Create certificate with minimal required fields
+	cert := &aggLayerTypesLatest.Certificate{
+		NetworkID:        a.Ethman.GetRollupId(),
+		Height:           proof.BatchNumberFinal,
+		NewLocalExitRoot: common.BytesToHash(inputs.NewLocalExitRoot),
+	}
+
+	// Create signature for the certificate
+	certHash := cert.Hash() // Keccak256Hash
+	signature, err := crypto.Sign(certHash.Bytes(), a.sequencerPrivateKey)
+	if err != nil {
+		log.Errorf("failed to sign certificate: %v", err)
+		a.handleFailureToSendToAggLayer(ctx, proof)
+		return false
+	}
+
+	// Add signature
+	cert.AggchainData = &aggLayerTypesLatest.AggchainDataSignature{
+		Signature: signature,
+	}
+
+	// Send certificate
+	certID, err := grpcClient.SendCertificate(ctx, cert)
+	if err != nil {
+		log.Errorf("failed to send certificate to agglayer: %v", err)
+		a.handleFailureToSendToAggLayer(ctx, proof)
+		return false
+	}
+
+	log.Infof("certificate %s sent to agglayer", certID.Hex())
+
+	// Wait for certificate to be processed with timeout
+	waitCtx, cancelFunc := context.WithTimeout(ctx, a.cfg.AggLayerTxTimeout.Duration)
+	defer cancelFunc()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-waitCtx.Done():
+			log.Errorf("timeout waiting for certificate to be processed")
+			a.handleFailureToSendToAggLayer(ctx, proof)
+			return false
+
+		case <-ticker.C:
+			certHeader, err := grpcClient.GetCertificateHeader(ctx, certID)
+			if err != nil {
+				log.Warnf("failed to get certificate status: %v", err)
+				continue
+			}
+
+			switch certHeader.Status {
+			case aggLayerTypesLatest.Settled:
+				log.Infof("certificate %s has been settled", certID.Hex())
+				// TODO(agglayer): this is just a POC where we trust the Settled status.
+				// For production:
+				// 1. Use AggOracle to verify the certificate's GER was properly published on L1
+				// 2. Use BridgeSync (?)
+				return true
+
+			case aggLayerTypesLatest.InError:
+				log.Errorf("certificate %s processing failed: %v", certID.Hex(), certHeader.Error)
+				a.handleFailureToSendToAggLayer(ctx, proof)
+				return false
+
+			default:
+				log.Debugf("certificate %s status: %s", certID.Hex(), certHeader.Status)
+			}
+		}
+	}
 }
 
 func (a *Aggregator) handleFailureToSendToAggLayer(ctx context.Context, proof *state.Proof) {
